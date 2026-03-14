@@ -299,7 +299,7 @@ describe("memory plugin unit tests", () => {
           })),
           query: vi.fn(() => ({
             limit: vi.fn(() => ({
-              toArray: vi.fn(async () => [{ agentId: "" }]),
+              toArray: vi.fn(async () => [{ agent_id: "" }]),
               select: vi.fn(() => ({
                 where: vi.fn(() => ({ toArray: vi.fn(async () => []) })),
                 toArray: vi.fn(async () => []),
@@ -420,7 +420,7 @@ describe("memory plugin unit tests", () => {
           })),
           query: vi.fn(() => ({
             limit: vi.fn(() => ({
-              toArray: vi.fn(async () => [{ agentId: "" }]),
+              toArray: vi.fn(async () => [{ agent_id: "" }]),
               select: vi.fn(() => ({ toArray: vi.fn(async () => []) })),
             })),
             where: vi.fn(() => ({
@@ -514,7 +514,7 @@ describe("memory plugin unit tests", () => {
           })),
           query: vi.fn(() => ({
             limit: vi.fn(() => ({
-              toArray: vi.fn(async () => [{ agentId: "" }]),
+              toArray: vi.fn(async () => [{ agent_id: "" }]),
               select: vi.fn(() => ({ toArray: vi.fn(async () => []) })),
             })),
             where: vi.fn(() => ({
@@ -587,7 +587,7 @@ describe("memory plugin unit tests", () => {
           })),
           query: vi.fn(() => ({
             limit: vi.fn(() => ({
-              toArray: vi.fn(async () => [{ agentId: "" }]),
+              toArray: vi.fn(async () => [{ agent_id: "" }]),
               select: vi.fn(() => ({ toArray: vi.fn(async () => []) })),
             })),
             where: vi.fn(() => ({
@@ -654,7 +654,7 @@ describe("memory plugin unit tests", () => {
           })),
           query: vi.fn(() => ({
             limit: vi.fn(() => ({
-              toArray: vi.fn(async () => [{ agentId: "" }]),
+              toArray: vi.fn(async () => [{ agent_id: "" }]),
               select: vi.fn(() => ({ toArray: vi.fn(async () => []) })),
             })),
             where: vi.fn(() => ({

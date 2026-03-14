@@ -53,12 +53,12 @@ type MemoryEntry = {
   vector: number[];
   importance: number;
   category: MemoryCategory;
-  createdAt: number;
-  agentId: string;
-  createdBy: string;
+  created_at: number;
+  agent_id: string;
+  created_by: string;
   scope: string;
-  ttlExpires: number;
-  chunkHash: string;
+  ttl_expires: number;
+  chunk_hash: string;
 };
 
 type MemorySearchResult = {
@@ -193,14 +193,14 @@ class MemoryDB {
       this.table = await this.db.openTable(TABLE_NAME);
       // Check if migration needed by reading one row
       const sample = await this.table.query().limit(1).toArray();
-      if (sample.length > 0 && !("agentId" in sample[0])) {
+      if (sample.length > 0 && "agentId" in sample[0]) {
         await this.migrateSchema();
       }
     } else {
       this.table = await this.db.createTable(TABLE_NAME, [{
         id: "__schema__", text: "", vector: new Array(this.vectorDim).fill(0),
-        importance: 0, category: "other", createdAt: 0,
-        agentId: "", createdBy: "", scope: "", ttlExpires: 0, chunkHash: ""
+        importance: 0, category: "other", created_at: 0,
+        agent_id: "", created_by: "", scope: "", ttl_expires: 0, chunk_hash: ""
       }]);
       await this.table.delete('id = "__schema__"');
     }
@@ -212,12 +212,17 @@ class MemoryDB {
 
     const allRows = await this.table!.query().toArray();
     const migrated = allRows.map(row => ({
-      ...row,
-      agentId: row.agentId ?? "",
-      createdBy: row.createdBy ?? row.agentId ?? "",
+      id: row.id ?? randomUUID(),
+      text: row.text ?? "",
+      vector: row.vector,
+      importance: row.importance ?? 0.5,
+      category: row.category ?? "other",
+      created_at: row.createdAt ?? row.created_at ?? Date.now(),
+      agent_id: row.agentId ?? row.agent_id ?? "",
       scope: row.scope ?? "",
-      ttlExpires: row.ttlExpires ?? 0,
-      chunkHash: row.chunkHash ?? "",
+      ttl_expires: row.ttlExpires ?? row.ttl_expires ?? 0,
+      chunk_hash: row.chunkHash ?? row.chunk_hash ?? "",
+      created_by: row.createdBy ?? row.created_by ?? row.agentId ?? row.agent_id ?? "",
     }));
 
     if (migrated.length > 0) {
@@ -245,14 +250,14 @@ class MemoryDB {
     }
   }
 
-  async store(entry: Omit<MemoryEntry, "id" | "createdAt" | "chunkHash" | "createdBy"> & { createdBy?: string }): Promise<MemoryEntry & { isDuplicate?: boolean }> {
+  async store(entry: Omit<MemoryEntry, "id" | "created_at" | "chunk_hash" | "created_by"> & { created_by?: string }): Promise<MemoryEntry & { isDuplicate?: boolean }> {
     await this.ensureInitialized();
 
     // Step 1: Exact dedup via chunkHash
-    const chunkHash = computeChunkHash(entry.agentId, entry.text);
+    const chunkHash = computeChunkHash(entry.agent_id, entry.text);
 
     if (/^[a-f0-9]+$/.test(chunkHash)) {
-      const existing = await this.table!.query().where(`chunkHash = '${chunkHash}'`).limit(1).toArray();
+      const existing = await this.table!.query().where(`chunk_hash = '${chunkHash}'`).limit(1).toArray();
       if (existing.length > 0) {
         return { ...existing[0] as MemoryEntry, isDuplicate: true };
       }
@@ -260,7 +265,7 @@ class MemoryDB {
 
     // Step 2: Near-dedup via cosine > 0.85
     if (entry.vector.length > 0) {
-      const nearDups = await this.search(entry.vector, { limit: 1, minScore: 0.85, agentId: entry.agentId });
+      const nearDups = await this.search(entry.vector, { limit: 1, minScore: 0.85, agentId: entry.agent_id });
       if (nearDups.length > 0) {
         return { ...nearDups[0].entry, isDuplicate: true };
       }
@@ -268,8 +273,8 @@ class MemoryDB {
 
     // Step 3: Store
     const fullEntry: MemoryEntry = {
-      ...entry, id: randomUUID(), createdAt: Date.now(), chunkHash,
-      createdBy: entry.createdBy || entry.agentId,
+      ...entry, id: randomUUID(), created_at: Date.now(), chunk_hash: chunkHash,
+      created_by: entry.created_by || entry.agent_id,
     };
     await this.table!.add([fullEntry]);
     return fullEntry;
@@ -291,7 +296,7 @@ class MemoryDB {
     let query = this.table!.vectorSearch(vector).distanceType("cosine").limit(limit * 3);
 
     if (agentId) {
-      query = query.where(`agentId = '${agentId}' OR scope != ''`);
+      query = query.where(`agent_id = '${agentId}' OR scope != ''`);
     }
 
     const results = await query.toArray();
@@ -300,11 +305,11 @@ class MemoryDB {
       if (score < minScore) return false;
 
       // TTL: skip expired
-      if (row.ttlExpires > 0 && Date.now() > row.ttlExpires) return false;
+      if (row.ttl_expires > 0 && Date.now() > row.ttl_expires) return false;
 
       // Visibility: own, fleet, or targeted scope
       if (agentId) {
-        const isOwn = row.agentId === agentId;
+        const isOwn = row.agent_id === agentId;
         const isFleet = row.scope === "fleet";
         const isTargeted = typeof row.scope === "string" && row.scope.includes(`,${agentId},`);
         if (!isOwn && !isFleet && !isTargeted) return false;
@@ -316,9 +321,9 @@ class MemoryDB {
       entry: {
         id: row.id, text: row.text, vector: row.vector,
         importance: row.importance, category: row.category,
-        createdAt: row.createdAt, agentId: row.agentId,
-        scope: row.scope, ttlExpires: row.ttlExpires, chunkHash: row.chunkHash,
-        createdBy: row.createdBy,
+        created_at: row.created_at, agent_id: row.agent_id,
+        scope: row.scope, ttl_expires: row.ttl_expires, chunk_hash: row.chunk_hash,
+        created_by: row.created_by,
       },
       score: Math.max(0, Math.min(1, 1 - (row._distance ?? 0))),
     }));
@@ -606,9 +611,9 @@ const memoryPlugin = {
             vector,
             importance,
             category,
-            agentId: callerAgentId ?? "unknown",
+            agent_id: callerAgentId ?? "unknown",
             scope: "",
-            ttlExpires,
+            ttl_expires: ttlExpires,
           });
 
           if (entry.isDuplicate) {
@@ -670,8 +675,8 @@ const memoryPlugin = {
             }
 
             const row = rows[0];
-            const isOwner = row.agentId === callerAgentId ||
-              (row.agentId === "shared" && row.createdBy === callerAgentId);
+            const isOwner = row.agent_id === callerAgentId ||
+              (row.agent_id === "shared" && row.created_by === callerAgentId);
             if (callerAgentId && !isOwner) {
               return {
                 content: [{ type: "text", text: "Cannot delete memories owned by other agents." }],
@@ -765,8 +770,8 @@ const memoryPlugin = {
           const old = results[0];
 
           // Ownership check
-          const isOwner = old.entry.agentId === callerAgentId ||
-            (old.entry.agentId === "shared" && old.entry.createdBy === callerAgentId);
+          const isOwner = old.entry.agent_id === callerAgentId ||
+            (old.entry.agent_id === "shared" && old.entry.created_by === callerAgentId);
           if (callerAgentId && !isOwner) {
             return {
               content: [{ type: "text", text: "Cannot update memories owned by other agents." }],
@@ -780,7 +785,7 @@ const memoryPlugin = {
           await db.delete(old.entry.id);
           const resolvedCategory = (MEMORY_CATEGORIES as readonly string[]).includes(category ?? "")
             ? (category as MemoryCategory) : old.entry.category;
-          await db.store({ text: newText, vector: newVector, importance: old.entry.importance, category: resolvedCategory, agentId: old.entry.agentId, createdBy: callerAgentId ?? "unknown", scope: old.entry.scope, ttlExpires: old.entry.ttlExpires });
+          await db.store({ text: newText, vector: newVector, importance: old.entry.importance, category: resolvedCategory, agent_id: old.entry.agent_id, created_by: callerAgentId ?? "unknown", scope: old.entry.scope, ttl_expires: old.entry.ttl_expires });
 
           return {
             content: [{ type: "text", text: `Updated: "${old.entry.text.slice(0, 60)}..." → "${newText.slice(0, 60)}..."` }],
@@ -827,8 +832,8 @@ const memoryPlugin = {
 
           const entry = await db.store({
             text, vector, importance: 0.7, category: resolvedCategory,
-            agentId: "shared", scope: normalizedScope, ttlExpires,
-            createdBy: callerAgentId ?? "unknown",
+            agent_id: "shared", scope: normalizedScope, ttl_expires: ttlExpires,
+            created_by: callerAgentId ?? "unknown",
           });
 
           return {
@@ -895,7 +900,7 @@ const memoryPlugin = {
 
               try {
                 const existing = await db.table!.query()
-                  .where(`chunkHash = '${hash}'`)
+                  .where(`chunk_hash = '${hash}'`)
                   .limit(1)
                   .toArray();
                 if (existing.length > 0) {
@@ -917,7 +922,7 @@ const memoryPlugin = {
               await db.store({
                 text: chunk, vector, importance: 0.3,
                 category: "fact" as MemoryCategory,
-                agentId: callerAgentId, scope: "", ttlExpires,
+                agent_id: callerAgentId, scope: "", ttl_expires: ttlExpires,
               });
               totalChunks++;
             }
@@ -950,14 +955,14 @@ const memoryPlugin = {
           .action(async (opts: any) => {
             const limit = parseInt(opts.limit);
             let query = db.table!.query().limit(limit)
-              .select(["id", "agentId", "scope", "category", "importance", "createdAt", "text", "ttlExpires"]);
+              .select(["id", "agent_id", "scope", "category", "importance", "created_at", "text", "ttl_expires"]);
 
             if (opts.agent) {
               if (!isValidAgentId(opts.agent)) {
                 console.error("Invalid agent ID format.");
                 return;
               }
-              query = query.where(`agentId = '${opts.agent}'`);
+              query = query.where(`agent_id = '${opts.agent}'`);
             }
 
             const rows = await query.toArray();
@@ -965,12 +970,12 @@ const memoryPlugin = {
             console.log(`Total memories: ${count} | Showing: ${rows.length}`);
             const output = rows.map(r => ({
               id: r.id,
-              agentId: r.agentId,
+              agent_id: r.agent_id,
               scope: r.scope || "(none)",
               category: r.category,
               importance: r.importance,
-              createdAt: new Date(r.createdAt).toISOString(),
-              ttlExpires: r.ttlExpires > 0 ? new Date(r.ttlExpires).toISOString() : "never",
+              created_at: new Date(r.created_at).toISOString(),
+              ttl_expires: r.ttl_expires > 0 ? new Date(r.ttl_expires).toISOString() : "never",
               text: String(r.text).slice(0, 120) + (String(r.text).length > 120 ? "..." : ""),
             }));
             console.log(JSON.stringify(output, null, 2));
@@ -989,7 +994,7 @@ const memoryPlugin = {
             });
             const output = results.map(r => ({
               id: r.entry.id, text: r.entry.text, category: r.entry.category,
-              importance: r.entry.importance, score: r.score, agentId: r.entry.agentId,
+              importance: r.entry.importance, score: r.score, agent_id: r.entry.agent_id,
             }));
             console.log(JSON.stringify(output, null, 2));
           });
@@ -1002,7 +1007,7 @@ const memoryPlugin = {
             console.log(`Total memories: ${count}`);
             if (opts.purgeExpired) {
               const now = Date.now();
-              await db.table?.delete(`ttlExpires > 0 AND ttlExpires < ${now}`);
+              await db.table?.delete(`ttl_expires > 0 AND ttl_expires < ${now}`);
               const after = await db.count();
               console.log(`Purged ${count - after} expired memories. Remaining: ${after}`);
             }
@@ -1122,9 +1127,9 @@ const memoryPlugin = {
               vector,
               importance: 0.7,
               category,
-              agentId: callerAgentId ?? "unknown",
+              agent_id: callerAgentId ?? "unknown",
               scope: "",
-              ttlExpires: 0,
+              ttl_expires: 0,
             });
             if (!entry.isDuplicate) {
               stored++;
