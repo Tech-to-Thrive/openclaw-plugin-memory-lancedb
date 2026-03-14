@@ -14,13 +14,17 @@ export type MemoryConfig = {
   autoCapture?: boolean;
   autoRecall?: boolean;
   captureMaxChars?: number;
+  recallLimit?: number;
+  recallMinScore?: number;
+  sensitiveAgents?: string[];
+  importanceDefault?: number;
 };
 
 export const MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
 export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 
 const DEFAULT_MODEL = "text-embedding-3-small";
-export const DEFAULT_CAPTURE_MAX_CHARS = 500;
+export const DEFAULT_CAPTURE_MAX_CHARS = 2000;
 const LEGACY_STATE_DIRS: string[] = [];
 
 function resolveDefaultDbPath(): string {
@@ -53,6 +57,14 @@ const DEFAULT_DB_PATH = resolveDefaultDbPath();
 const EMBEDDING_DIMENSIONS: Record<string, number> = {
   "text-embedding-3-small": 1536,
   "text-embedding-3-large": 3072,
+  "text-embedding-004": 768,
+  "embedding-001": 768,
+  "models/embedding-001": 768,
+  "models/text-embedding-004": 768,
+  "gemini-embedding-2-preview": 3072,
+  "models/gemini-embedding-2-preview": 3072,
+  "embed-english-v3.0": 1024,
+  "embed-multilingual-v3.0": 1024,
 };
 
 function assertAllowedKeys(value: Record<string, unknown>, allowed: string[], label: string) {
@@ -97,7 +109,7 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "dbPath", "autoCapture", "autoRecall", "captureMaxChars"],
+      ["embedding", "dbPath", "autoCapture", "autoRecall", "captureMaxChars", "sensitiveAgents", "recallLimit", "recallMinScore", "importanceDefault"],
       "memory config",
     );
 
@@ -118,6 +130,8 @@ export const memoryConfigSchema = {
       throw new Error("captureMaxChars must be between 100 and 10000");
     }
 
+    const sensitiveAgents = Array.isArray(cfg.sensitiveAgents) ? cfg.sensitiveAgents.filter((s): s is string => typeof s === "string") : [];
+
     return {
       embedding: {
         provider: "openai",
@@ -128,9 +142,13 @@ export const memoryConfigSchema = {
         dimensions: typeof embedding.dimensions === "number" ? embedding.dimensions : undefined,
       },
       dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : DEFAULT_DB_PATH,
-      autoCapture: cfg.autoCapture === true,
+      autoCapture: cfg.autoCapture !== false,
       autoRecall: cfg.autoRecall !== false,
       captureMaxChars: captureMaxChars ?? DEFAULT_CAPTURE_MAX_CHARS,
+      recallLimit: typeof cfg.recallLimit === "number" ? cfg.recallLimit : 5,
+      recallMinScore: typeof cfg.recallMinScore === "number" ? cfg.recallMinScore : 0.3,
+      sensitiveAgents,
+      importanceDefault: typeof cfg.importanceDefault === "number" ? cfg.importanceDefault : 0.5,
     };
   },
   uiHints: {
@@ -175,6 +193,29 @@ export const memoryConfigSchema = {
       help: "Maximum message length eligible for auto-capture",
       advanced: true,
       placeholder: String(DEFAULT_CAPTURE_MAX_CHARS),
+    },
+    recallLimit: {
+      label: "Recall Limit",
+      help: "Maximum number of memories to inject during auto-recall",
+      advanced: true,
+      placeholder: "5",
+    },
+    recallMinScore: {
+      label: "Recall Min Score",
+      help: "Minimum similarity score for auto-recall (0.0 - 1.0)",
+      advanced: true,
+      placeholder: "0.3",
+    },
+    sensitiveAgents: {
+      label: "Sensitive Agents",
+      help: "Agent IDs that should only see their own memories + fleet-scoped shared memories",
+      advanced: true,
+    },
+    importanceDefault: {
+      label: "Default Importance",
+      help: "Default importance score for auto-captured memories (0.0 - 1.0)",
+      advanced: true,
+      placeholder: "0.5",
     },
   },
 };

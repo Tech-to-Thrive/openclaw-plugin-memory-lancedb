@@ -42,7 +42,30 @@
       "label": "Capture Max Chars",
       "help": "Maximum message length eligible for auto-capture",
       "advanced": true,
-      "placeholder": "500"
+      "placeholder": "2000"
+    },
+    "recallLimit": {
+      "label": "Recall Limit",
+      "help": "Maximum number of memories to inject during auto-recall",
+      "advanced": true,
+      "placeholder": "5"
+    },
+    "recallMinScore": {
+      "label": "Recall Min Score",
+      "help": "Minimum similarity score for auto-recall (0.0 - 1.0)",
+      "advanced": true,
+      "placeholder": "0.3"
+    },
+    "sensitiveAgents": {
+      "label": "Sensitive Agents",
+      "help": "Agent IDs that should only see their own memories + fleet-scoped shared memories",
+      "advanced": true
+    },
+    "importanceDefault": {
+      "label": "Default Importance",
+      "help": "Default importance score for auto-captured memories (0.0 - 1.0)",
+      "advanced": true,
+      "placeholder": "0.5"
     }
   },
   "configSchema": {
@@ -81,6 +104,21 @@
         "type": "number",
         "minimum": 100,
         "maximum": 10000
+      },
+      "recallLimit": {
+        "type": "number"
+      },
+      "recallMinScore": {
+        "type": "number"
+      },
+      "sensitiveAgents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "importanceDefault": {
+        "type": "number"
       }
     },
     "required": ["embedding"]
