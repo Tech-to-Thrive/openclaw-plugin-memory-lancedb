@@ -19,5 +19,32 @@ declare module "openclaw/plugin-sdk/memory-lancedb" {
     }) => void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     on: (event: string, handler: (...args: any[]) => Promise<unknown>) => void;
+    registerCommand: (command: {
+      name: string;
+      description: string;
+      acceptsArgs?: boolean;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      handler: (ctx: any) => Promise<{ text: string }>;
+    }) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    registerHook: (hookName: string, handler: (event: any) => Promise<void>, opts?: { name?: string }) => void;
+    config: {
+      agents?: {
+        list?: Array<{ id: string; [key: string]: unknown }>;
+      };
+      [key: string]: unknown;
+    };
+    runtime: {
+      config: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        loadConfig(): any;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        writeConfigFile(config: any): Promise<void>;
+      };
+      agent: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        resolveAgentWorkspaceDir(config: any, agentId: string): string | undefined;
+      };
+    };
   }
 }

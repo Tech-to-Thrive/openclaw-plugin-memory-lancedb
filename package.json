@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/memory-lancedb",
+  "name": "@openclaw/memory-lancedb-ttt",
   "version": "2026.3.13-ttt.2",
   "private": true,
   "description": "OpenClaw LanceDB-backed long-term memory plugin with auto-recall/capture",
@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@lancedb/lancedb": "^0.26.2",
+    "@lancedb/lancedb": "^0.27.1",
     "@lancedb/lancedb-darwin-x64": "^0.22.3",
     "@sinclair/typebox": "0.34.48",
     "openai": "^6.27.0"

@@ -1,5 +1,5 @@
 {
-  "id": "memory-lancedb",
+  "id": "memory-lancedb-ttt",
   "kind": "memory",
   "uiHints": {
     "embedding.apiKey": {
@@ -66,6 +66,22 @@
       "help": "Default importance score for auto-captured memories (0.0 - 1.0)",
       "advanced": true,
       "placeholder": "0.5"
+    },
+    "dreaming.enabled": {
+      "label": "Dreaming Enabled",
+      "help": "Enable periodic memory dreaming across light, REM, and deep phases"
+    },
+    "dreaming.frequency": {
+      "label": "Dreaming Frequency",
+      "help": "Cron expression for the dreaming sweep schedule",
+      "placeholder": "0 3 * * *",
+      "advanced": true
+    },
+    "dreaming.timezone": {
+      "label": "Dreaming Timezone",
+      "help": "Timezone used for dream report dates and scheduling",
+      "placeholder": "America/Chicago",
+      "advanced": true
     }
   },
   "configSchema": {
@@ -88,8 +104,7 @@
           "dimensions": {
             "type": "number"
           }
-        },
-        "required": ["apiKey"]
+        }
       },
       "dbPath": {
         "type": "string"
@@ -119,8 +134,22 @@
       },
       "importanceDefault": {
         "type": "number"
+      },
+      "dreaming": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "frequency": {
+            "type": "string"
+          },
+          "timezone": {
+            "type": "string"
+          }
+        }
       }
-    },
-    "required": ["embedding"]
+    }
   }
 }

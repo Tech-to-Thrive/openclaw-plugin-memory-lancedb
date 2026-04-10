@@ -16,8 +16,9 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { readdir, readFile, stat } from "node:fs/promises";
-import { join, extname } from "node:path";
+import { readdir, readFile, writeFile, stat, mkdir, unlink } from "node:fs/promises";
+import { join, extname, basename, dirname } from "node:path";
+import { homedir } from "node:os";
 import type * as LanceDB from "@lancedb/lancedb";
 import { Type } from "@sinclair/typebox";
 import OpenAI from "openai";
@@ -27,6 +28,7 @@ import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
   type MemoryConfig,
+  type DreamingConfig,
   memoryConfigSchema,
   vectorDimsForModel,
 } from "./config.js";
@@ -43,7 +45,7 @@ const loadLanceDB = async (): Promise<typeof import("@lancedb/lancedb")> => {
   try {
     return await lancedbImportPromise;
   } catch (err) {
-    throw new Error(`memory-lancedb: failed to load LanceDB. ${String(err)}`, { cause: err });
+    throw new Error(`memory-lancedb-ttt: failed to load LanceDB. ${String(err)}`, { cause: err });
   }
 };
 
@@ -154,6 +156,743 @@ async function findMarkdownFiles(dir: string): Promise<string[]> {
     // Directory may not exist
   }
   return results;
+}
+
+type RecallTrace = {
+  agentId: string;
+  queryHash: string;
+  memoryIds: string[];
+  timestamp: string;
+};
+
+type LightCandidate = {
+  key: string;
+  text: string;
+  source: "recall" | "daily";
+  workspaceDir: string;
+  agentIds: string[];
+  memoryIds: string[];
+  recallCount: number;
+  queryHashes: string[];
+  timestamps: string[];
+  dailyHits: number;
+  conceptTags: string[];
+};
+
+type PhaseSignal = {
+  key: string;
+  signalType: "light" | "rem";
+  strength: number;
+  timestamp: string;
+  workspaceDir: string;
+};
+
+type DeepPromotion = {
+  key: string;
+  text: string;
+  score: number;
+  workspaceDir: string;
+  source: string[];
+  promotedAt: string;
+};
+
+const DREAMING_SYSTEM_EVENT_TEXT = "__openclaw_memory_lancedb_ttt_dream__";
+const MANAGED_DREAMING_CRON_NAME = "Memory LanceDB Dreaming";
+const MANAGED_DREAMING_CRON_TAG = "[managed-by=memory-lancedb-ttt.dreaming]";
+const DEFAULT_DREAMING_FREQUENCY = "0 3 * * *";
+const DREAMS_DIR_RELATIVE = join("memory", ".dreams");
+const RECALL_TRACES_FILE = "recall-traces.json";
+const LIGHT_CANDIDATES_FILE = "light-candidates.json";
+const PHASE_SIGNALS_FILE = "phase-signals.json";
+const DREAMING_STATUS_FILE = "status.json";
+
+function hashText(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+function formatDateStamp(nowMs = Date.now(), timezone = "America/Chicago"): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(nowMs));
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  if (year && month && day) {
+    return `${year}-${month}-${day}`;
+  }
+  return new Date(nowMs).toISOString().slice(0, 10);
+}
+
+async function ensureDir(path: string): Promise<void> {
+  await mkdir(path, { recursive: true });
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readJsonFile<T>(path: string, fallback: T): Promise<T> {
+  try {
+    const raw = await readFile(path, "utf-8");
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJsonFile(path: string, value: unknown): Promise<void> {
+  await ensureDir(dirname(path));
+  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+}
+
+async function withFileLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
+  await ensureDir(dirname(lockPath));
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      await writeFile(lockPath, String(process.pid), { flag: "wx" });
+      break;
+    } catch {
+      try {
+        const lockStat = await stat(lockPath);
+        if (Date.now() - lockStat.mtimeMs > 10 * 60 * 1000) {
+          await writeFile(lockPath, String(process.pid), "utf-8");
+          break;
+        }
+      } catch {
+        // keep waiting
+      }
+      if (Date.now() - startedAt > 15_000) {
+        throw new Error(`Timed out waiting for lock: ${lockPath}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    try {
+      await unlink(lockPath);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => typeof value === "string" && value.trim().length > 0))];
+}
+
+function normalizeDreamingConfig(cfg?: DreamingConfig): Required<Pick<DreamingConfig, "enabled" | "frequency">> & Pick<DreamingConfig, "timezone"> {
+  return {
+    enabled: cfg?.enabled === true,
+    frequency: cfg?.frequency || DEFAULT_DREAMING_FREQUENCY,
+    timezone: cfg?.timezone,
+  };
+}
+
+function isSensitiveAgent(agentId: string, sensitiveAgents: string[] | undefined): boolean {
+  return Array.isArray(sensitiveAgents) && sensitiveAgents.includes(agentId);
+}
+
+function canCrossPollinate(agentIds: string[], sensitiveAgents: string[] | undefined): boolean {
+  return !agentIds.some((agentId) => isSensitiveAgent(agentId, sensitiveAgents));
+}
+
+function buildManagedDreamingCronJob(config: { frequency: string; timezone?: string }) {
+  return {
+    name: MANAGED_DREAMING_CRON_NAME,
+    description: `${MANAGED_DREAMING_CRON_TAG} Run light -> REM -> deep sweep for memory-lancedb-ttt.`,
+    enabled: true,
+    schedule: {
+      kind: "cron" as const,
+      expr: config.frequency,
+      ...(config.timezone ? { tz: config.timezone } : {}),
+    },
+    sessionTarget: "main",
+    wakeMode: "next-heartbeat",
+    payload: {
+      kind: "systemEvent",
+      text: DREAMING_SYSTEM_EVENT_TEXT,
+    },
+  };
+}
+
+function isManagedDreamingJob(job: Record<string, unknown>): boolean {
+  const name = typeof job.name === "string" ? job.name : "";
+  const description = typeof job.description === "string" ? job.description : "";
+  const payload = job.payload as Record<string, unknown> | undefined;
+  const payloadText = typeof payload?.text === "string" ? payload.text : "";
+  return description.includes(MANAGED_DREAMING_CRON_TAG)
+    || (name === MANAGED_DREAMING_CRON_NAME && payloadText === DREAMING_SYSTEM_EVENT_TEXT);
+}
+
+export async function reconcileDreamingCronJob(params: {
+  cron: {
+    list: (input: { includeDisabled: boolean }) => Promise<Record<string, unknown>[]>;
+    add: (job: Record<string, unknown>) => Promise<unknown>;
+    update: (id: string, patch: Record<string, unknown>) => Promise<unknown>;
+    remove: (id: string) => Promise<{ removed?: boolean }>;
+  } | null;
+  config: { enabled: boolean; frequency: string; timezone?: string };
+  logger: { info: (msg: string) => void; warn: (msg: string) => void };
+}): Promise<void> {
+  const { cron, config, logger } = params;
+  if (!cron) {
+    if (config.enabled) {
+      logger.warn("memory-lancedb-ttt: managed dreaming cron unavailable.");
+    }
+    return;
+  }
+
+  const jobs = await cron.list({ includeDisabled: true });
+  const managed = jobs.filter((job) => isManagedDreamingJob(job));
+
+  if (!config.enabled) {
+    for (const job of managed) {
+      const id = typeof job.id === "string" ? job.id : "";
+      if (!id) continue;
+      try {
+        await cron.remove(id);
+      } catch (err) {
+        logger.warn(`memory-lancedb-ttt: failed removing dreaming cron ${id}: ${String(err)}`);
+      }
+    }
+    return;
+  }
+
+  const desired = buildManagedDreamingCronJob(config);
+  if (managed.length === 0) {
+    await cron.add(desired);
+    logger.info("memory-lancedb-ttt: created managed dreaming cron job.");
+    return;
+  }
+
+  const [primary, ...duplicates] = managed;
+  for (const duplicate of duplicates) {
+    const id = typeof duplicate.id === "string" ? duplicate.id : "";
+    if (!id) continue;
+    try {
+      await cron.remove(id);
+    } catch (err) {
+      logger.warn(`memory-lancedb-ttt: failed pruning duplicate dreaming cron ${id}: ${String(err)}`);
+    }
+  }
+
+  const primaryId = typeof primary.id === "string" ? primary.id : "";
+  if (primaryId) {
+    await cron.update(primaryId, {
+      description: desired.description,
+      enabled: true,
+      schedule: desired.schedule,
+      sessionTarget: desired.sessionTarget,
+      wakeMode: desired.wakeMode,
+      payload: desired.payload,
+    });
+    logger.info("memory-lancedb-ttt: updated managed dreaming cron job.");
+  }
+}
+
+function resolveCronServiceFromStartupEvent(event: unknown): {
+  list: (input: { includeDisabled: boolean }) => Promise<Record<string, unknown>[]>;
+  add: (job: Record<string, unknown>) => Promise<unknown>;
+  update: (id: string, patch: Record<string, unknown>) => Promise<unknown>;
+  remove: (id: string) => Promise<{ removed?: boolean }>;
+} | null {
+  if (!event || typeof event !== "object") return null;
+  const payload = event as Record<string, unknown>;
+  if (payload.type !== "gateway" || payload.action !== "startup") return null;
+  const context = payload.context as Record<string, unknown> | undefined;
+  const deps = context?.deps as Record<string, unknown> | undefined;
+  const cronCandidate = context?.cron ?? deps?.cron;
+  if (!cronCandidate || typeof cronCandidate !== "object") return null;
+  const cron = cronCandidate as Record<string, unknown>;
+  if (
+    typeof cron.list !== "function"
+    || typeof cron.add !== "function"
+    || typeof cron.update !== "function"
+    || typeof cron.remove !== "function"
+  ) {
+    return null;
+  }
+  return cron as {
+    list: (input: { includeDisabled: boolean }) => Promise<Record<string, unknown>[]>;
+    add: (job: Record<string, unknown>) => Promise<unknown>;
+    update: (id: string, patch: Record<string, unknown>) => Promise<unknown>;
+    remove: (id: string) => Promise<{ removed?: boolean }>;
+  };
+}
+
+function resolveAllWorkspaceEntries(api: OpenClawPluginApi): Array<{ agentIds: string[]; workspaceDir: string }> {
+  const configured = Array.isArray(api.config.agents?.list) ? api.config.agents.list : [];
+  const agentIds: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of configured) {
+    if (!entry || typeof entry !== "object" || typeof entry.id !== "string") continue;
+    const id = entry.id.trim().toLowerCase();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    agentIds.push(id);
+  }
+  if (agentIds.length === 0) {
+    agentIds.push("engineering");
+  }
+
+  const byWorkspace = new Map<string, { agentIds: string[]; workspaceDir: string }>();
+  for (const agentId of agentIds) {
+    const workspaceDir = api.runtime.agent.resolveAgentWorkspaceDir(api.config, agentId)?.trim();
+    if (!workspaceDir) continue;
+    const existing = byWorkspace.get(workspaceDir);
+    if (existing) {
+      existing.agentIds.push(agentId);
+    } else {
+      byWorkspace.set(workspaceDir, { workspaceDir, agentIds: [agentId] });
+    }
+  }
+  return [...byWorkspace.values()];
+}
+
+export async function appendRecallTrace(workspaceDir: string, trace: RecallTrace): Promise<void> {
+  const dreamsDir = join(workspaceDir, DREAMS_DIR_RELATIVE);
+  const tracesPath = join(dreamsDir, RECALL_TRACES_FILE);
+  const lockPath = join(dreamsDir, `${RECALL_TRACES_FILE}.lock`);
+
+  await withFileLock(lockPath, async () => {
+    const traces = await readJsonFile<RecallTrace[]>(tracesPath, []);
+    traces.push(trace);
+    const trimmed = traces.slice(-5000);
+    await writeJsonFile(tracesPath, trimmed);
+  });
+}
+
+export async function writeDreamSection(workspaceDir: string, heading: string, body: string): Promise<void> {
+  const candidates = [join(workspaceDir, "DREAMS.md"), join(workspaceDir, "dreams.md")];
+  let dreamsPath = candidates[0];
+  for (const candidate of candidates) {
+    if (await pathExists(candidate)) {
+      dreamsPath = candidate;
+      break;
+    }
+  }
+
+  const content = await readFile(dreamsPath, "utf-8").catch(() => "");
+  const sectionHeader = `## ${heading}`;
+  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sectionRegex = new RegExp(`^## ${escapedHeading}\\n(?:(?!## ).*\\n?)*`, "m");
+  const nextBlock = `${sectionHeader}\n${body.trim()}\n\n`;
+
+  let updated: string;
+  if (sectionRegex.test(content)) {
+    updated = content.replace(sectionRegex, nextBlock);
+  } else if (!content.trim()) {
+    updated = nextBlock;
+  } else {
+    updated = `${content.trimEnd()}\n\n${nextBlock}`;
+  }
+
+  await writeFile(dreamsPath, updated, "utf-8");
+}
+
+function deriveConceptTags(text: string): string[] {
+  return dedupeStrings((normalizeForHash(text).match(/[a-z0-9_-]{5,}/g) || []).slice(0, 12));
+}
+
+async function readDreamingStatusAt(baseDir: string): Promise<Record<string, unknown>> {
+  const statusPath = join(baseDir, "memory", ".dreams", DREAMING_STATUS_FILE);
+  return readJsonFile<Record<string, unknown>>(statusPath, {});
+}
+
+async function updateDreamingStatusAt(baseDir: string, patch: Record<string, unknown>): Promise<void> {
+  const statusPath = join(baseDir, "memory", ".dreams", DREAMING_STATUS_FILE);
+  const current = await readJsonFile<Record<string, unknown>>(statusPath, {});
+  await writeJsonFile(statusPath, {
+    ...current,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+export async function cleanupOldDeepReports(workspaceDir: string, maxAgeDays = 30): Promise<number> {
+  const deepDir = join(workspaceDir, "memory", "dreaming", "deep");
+  let removed = 0;
+  try {
+    const entries = await readdir(deepDir);
+    const cutoff = Date.now() - maxAgeDays * 86_400_000;
+    for (const entry of entries) {
+      if (!entry.endsWith(".md")) continue;
+      const fullPath = join(deepDir, entry);
+      try {
+        const fileStat = await stat(fullPath);
+        if (fileStat.mtimeMs < cutoff) {
+          await unlink(fullPath);
+          removed++;
+        }
+      } catch {
+        // skip files that can't be stat'd
+      }
+    }
+  } catch {
+    // directory may not exist yet
+  }
+  return removed;
+}
+
+export async function runLightPhase(
+  apiRef: OpenClawPluginApi,
+  dbRef: { table: { query: () => { where: (clause: string) => { limit: (n: number) => { toArray: () => Promise<unknown[]> } } } } | null },
+  _embeddingsRef: unknown,
+  cfgRef: MemoryConfig,
+): Promise<{ processed: number; workspaces: number }> {
+  const dreaming = normalizeDreamingConfig(cfgRef.dreaming);
+  const workspaceEntries = resolveAllWorkspaceEntries(apiRef);
+  let processed = 0;
+
+  for (const entry of workspaceEntries) {
+    const { workspaceDir, agentIds } = entry;
+    const dreamsDir = join(workspaceDir, DREAMS_DIR_RELATIVE);
+    const tracesPath = join(dreamsDir, RECALL_TRACES_FILE);
+    const candidatesPath = join(dreamsDir, LIGHT_CANDIDATES_FILE);
+    const lockPath = join(dreamsDir, `${LIGHT_CANDIDATES_FILE}.lock`);
+    const memoryDir = join(workspaceDir, "memory");
+    const traces = await readJsonFile<RecallTrace[]>(tracesPath, []);
+    const files = await findMarkdownFiles(memoryDir);
+    const byKey = new Map<string, LightCandidate>();
+
+    for (const trace of traces.slice(-1000)) {
+      if (!canCrossPollinate([trace.agentId, ...agentIds], cfgRef.sensitiveAgents)) {
+        continue;
+      }
+      for (const memoryId of trace.memoryIds) {
+        try {
+          const rows = await dbRef.table?.query().where(`id = '${memoryId}'`).limit(1).toArray() ?? [];
+          const row = rows[0] as MemoryEntry | undefined;
+          if (!row?.text) continue;
+          const key = row.chunk_hash || computeChunkHash(row.agent_id, row.text);
+          const existing = byKey.get(key);
+          const conceptTags = deriveConceptTags(row.text);
+          if (existing) {
+            existing.recallCount += 1;
+            existing.queryHashes = dedupeStrings([...existing.queryHashes, trace.queryHash]);
+            existing.timestamps = dedupeStrings([...existing.timestamps, trace.timestamp]);
+            existing.memoryIds = dedupeStrings([...existing.memoryIds, memoryId]);
+            existing.conceptTags = dedupeStrings([...existing.conceptTags, ...conceptTags]);
+          } else {
+            byKey.set(key, {
+              key,
+              text: row.text,
+              source: "recall",
+              workspaceDir,
+              agentIds: [...agentIds],
+              memoryIds: [memoryId],
+              recallCount: 1,
+              queryHashes: [trace.queryHash],
+              timestamps: [trace.timestamp],
+              dailyHits: 0,
+              conceptTags,
+            });
+          }
+        } catch {
+          // skip bad memory ids
+        }
+      }
+    }
+
+    for (const file of files) {
+      if (basename(file) === "MEMORY.md" || basename(file) === "DREAMS.md" || file.includes(`${DREAMS_DIR_RELATIVE}`)) {
+        continue;
+      }
+      if (!canCrossPollinate(agentIds, cfgRef.sensitiveAgents)) {
+        continue;
+      }
+      const content = await readFile(file, "utf-8").catch(() => "");
+      for (const chunk of chunkText(content).slice(0, 12)) {
+        const trimmed = chunk.trim();
+        if (trimmed.length < 40) continue;
+        const key = hashText(trimmed);
+        const existing = byKey.get(key);
+        const conceptTags = deriveConceptTags(trimmed);
+        if (existing) {
+          existing.dailyHits += 1;
+          existing.conceptTags = dedupeStrings([...existing.conceptTags, ...conceptTags]);
+        } else {
+          byKey.set(key, {
+            key,
+            text: trimmed,
+            source: "daily",
+            workspaceDir,
+            agentIds: [...agentIds],
+            memoryIds: [],
+            recallCount: 0,
+            queryHashes: [],
+            timestamps: [],
+            dailyHits: 1,
+            conceptTags,
+          });
+        }
+      }
+    }
+
+    const candidates = [...byKey.values()].sort((a, b) => {
+      const scoreA = (a.recallCount * 3) + (a.dailyHits * 1.5) + a.queryHashes.length;
+      const scoreB = (b.recallCount * 3) + (b.dailyHits * 1.5) + b.queryHashes.length;
+      return scoreB - scoreA;
+    }).slice(0, 100);
+
+    await withFileLock(lockPath, async () => {
+      await writeJsonFile(candidatesPath, candidates);
+    });
+
+    const lines = [
+      `Updated: ${new Date().toISOString()}`,
+      `Candidates staged: ${candidates.length}`,
+      "",
+      ...candidates.slice(0, 10).map((candidate, index) => `${index + 1}. ${candidate.text.slice(0, 160).replace(/\s+/g, " ")} [recalls=${candidate.recallCount}, daily=${candidate.dailyHits}]`),
+    ];
+    await writeDreamSection(workspaceDir, "Light Sleep", lines.join("\n"));
+    processed += candidates.length;
+  }
+
+  await updateDreamingStatusAt(apiRef.resolvePath("~/.openclaw"), {
+    lastLightRun: new Date().toISOString(),
+    lastLightProcessed: processed,
+    timezone: dreaming.timezone,
+  });
+  return { processed, workspaces: workspaceEntries.length };
+}
+
+export async function runRemPhase(
+  apiRef: OpenClawPluginApi,
+  _dbRef: unknown,
+  _embeddingsRef: unknown,
+  cfgRef: MemoryConfig,
+): Promise<{ signals: number; workspaces: number }> {
+  const workspaceEntries = resolveAllWorkspaceEntries(apiRef);
+  let signalsWritten = 0;
+
+  for (const entry of workspaceEntries) {
+    const { workspaceDir, agentIds } = entry;
+    if (!canCrossPollinate(agentIds, cfgRef.sensitiveAgents)) {
+      continue;
+    }
+    const dreamsDir = join(workspaceDir, DREAMS_DIR_RELATIVE);
+    const candidatesPath = join(dreamsDir, LIGHT_CANDIDATES_FILE);
+    const signalsPath = join(dreamsDir, PHASE_SIGNALS_FILE);
+    const lockPath = join(dreamsDir, `${PHASE_SIGNALS_FILE}.lock`);
+    const candidates = await readJsonFile<LightCandidate[]>(candidatesPath, []);
+    const conceptCounts = new Map<string, number>();
+
+    for (const candidate of candidates) {
+      for (const tag of candidate.conceptTags) {
+        conceptCounts.set(tag, (conceptCounts.get(tag) ?? 0) + 1);
+      }
+    }
+
+    const topThemes = [...conceptCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12);
+
+    const signals: PhaseSignal[] = candidates.slice(0, 40).map((candidate) => ({
+      key: candidate.key,
+      signalType: "rem",
+      strength: Math.min(1, 0.2 + (candidate.recallCount * 0.12) + (candidate.queryHashes.length * 0.08) + (candidate.dailyHits * 0.05)),
+      timestamp: new Date().toISOString(),
+      workspaceDir,
+    }));
+
+    await withFileLock(lockPath, async () => {
+      const existing = await readJsonFile<PhaseSignal[]>(signalsPath, []);
+      await writeJsonFile(signalsPath, [...existing.slice(-2000), ...signals].slice(-2500));
+    });
+
+    const lines = [
+      `Updated: ${new Date().toISOString()}`,
+      `Themes detected: ${topThemes.length}`,
+      "",
+      ...topThemes.map(([theme, count], index) => `${index + 1}. ${theme} (${count})`),
+      "",
+      "Reflections:",
+      `- Recurring ideas are clustering around ${topThemes.slice(0, 3).map(([theme]) => theme).join(", ") || "general operational memory"}.`,
+      `- Strongest candidates are those appearing across both recall traces and daily notes.`,
+      `- Sensitive-agent isolation remained ${Array.isArray(cfgRef.sensitiveAgents) && cfgRef.sensitiveAgents.length > 0 ? "active" : "inactive"}.`,
+    ];
+    await writeDreamSection(workspaceDir, "REM Sleep", lines.join("\n"));
+    signalsWritten += signals.length;
+  }
+
+  await updateDreamingStatusAt(apiRef.resolvePath("~/.openclaw"), {
+    lastRemRun: new Date().toISOString(),
+    lastRemSignals: signalsWritten,
+  });
+  return { signals: signalsWritten, workspaces: workspaceEntries.length };
+}
+
+export async function runDeepPhase(
+  apiRef: OpenClawPluginApi,
+  dbRef: { store: (entry: Omit<MemoryEntry, "id" | "created_at" | "chunk_hash" | "created_by"> & { created_by?: string }) => Promise<MemoryEntry & { isDuplicate?: boolean }> },
+  embeddingsRef: { embed: (text: string) => Promise<number[]> },
+  cfgRef: MemoryConfig,
+): Promise<{ promoted: number; workspaces: number }> {
+  const timezone = normalizeDreamingConfig(cfgRef.dreaming).timezone || "America/Chicago";
+  const today = formatDateStamp(Date.now(), timezone);
+  const workspaceEntries = resolveAllWorkspaceEntries(apiRef);
+  let promoted = 0;
+
+  for (const entry of workspaceEntries) {
+    const { workspaceDir, agentIds } = entry;
+    const primaryAgentId = agentIds[0] || "engineering";
+    const dreamsDir = join(workspaceDir, DREAMS_DIR_RELATIVE);
+    const candidatesPath = join(dreamsDir, LIGHT_CANDIDATES_FILE);
+    const signalsPath = join(dreamsDir, PHASE_SIGNALS_FILE);
+    const deepReportPath = join(workspaceDir, "memory", "dreaming", "deep", `${today}.md`);
+    const memoryPath = join(workspaceDir, "MEMORY.md");
+    if (!canCrossPollinate(agentIds, cfgRef.sensitiveAgents)) {
+      continue;
+    }
+
+    await cleanupOldDeepReports(workspaceDir);
+
+    const candidates = await readJsonFile<LightCandidate[]>(candidatesPath, []);
+    const phaseSignals = await readJsonFile<PhaseSignal[]>(signalsPath, []);
+    const phaseSignalMap = new Map<string, number>();
+    for (const signal of phaseSignals) {
+      phaseSignalMap.set(signal.key, Math.max(phaseSignalMap.get(signal.key) ?? 0, signal.strength));
+    }
+
+    const ranked = candidates.map((candidate) => {
+      const latestTs = candidate.timestamps.map((value) => Date.parse(value)).filter((value) => Number.isFinite(value)).sort((a, b) => b - a)[0] ?? Date.now();
+      const ageDays = Math.max(0, (Date.now() - latestTs) / 86_400_000);
+      const recency = Math.max(0, 1 - Math.min(ageDays / 30, 1));
+      const frequency = Math.min(1, (candidate.recallCount + candidate.dailyHits) / 8);
+      const relevance = Math.min(1, ((candidate.recallCount * 0.7) + (candidate.dailyHits * 0.3)) / 6);
+      const queryDiversity = Math.min(1, candidate.queryHashes.length / 5);
+      const consolidation = Math.min(1, dedupeStrings(candidate.timestamps.map((value) => value.slice(0, 10))).length / 5);
+      const conceptualRichness = Math.min(1, candidate.conceptTags.length / 8);
+      const phaseBoost = Math.min(0.15, phaseSignalMap.get(candidate.key) ?? 0);
+      const score =
+        (frequency * 0.24)
+        + (relevance * 0.30)
+        + (queryDiversity * 0.15)
+        + (recency * 0.15)
+        + (consolidation * 0.10)
+        + (conceptualRichness * 0.06)
+        + phaseBoost;
+      return { candidate, score };
+    }).sort((a, b) => b.score - a.score);
+
+    const winners = ranked.filter(({ candidate, score }) => (
+      score >= 0.56
+      && (candidate.recallCount >= 2 || candidate.dailyHits >= 2)
+      && (candidate.queryHashes.length >= 1 || candidate.dailyHits >= 3)
+    )).slice(0, 8);
+
+    const memoryContent = await readFile(memoryPath, "utf-8").catch(() => "");
+    const deepPromotions: DeepPromotion[] = [];
+
+    for (const winner of winners) {
+      const text = winner.candidate.text.trim();
+      if (!text || memoryContent.includes(text.slice(0, Math.min(80, text.length)))) {
+        continue;
+      }
+      let vector: number[];
+      try {
+        vector = await embeddingsRef.embed(text);
+      } catch (err) {
+        apiRef.logger.warn(`memory-lancedb-ttt: deep phase embed failed: ${String(err)}`);
+        continue;
+      }
+      const stored = await dbRef.store({
+        text,
+        vector,
+        importance: Math.min(1, 0.6 + (winner.score * 0.3)),
+        category: detectCategory(text),
+        agent_id: primaryAgentId,
+        scope: "",
+        ttl_expires: 0,
+        created_by: primaryAgentId,
+      });
+      if (stored.isDuplicate) {
+        continue;
+      }
+      deepPromotions.push({
+        key: winner.candidate.key,
+        text,
+        score: winner.score,
+        workspaceDir,
+        source: [winner.candidate.source],
+        promotedAt: new Date().toISOString(),
+      });
+      promoted += 1;
+    }
+
+    if (deepPromotions.length > 0) {
+      await ensureDir(dirname(deepReportPath));
+      const reportLines = [
+        `# Deep Sleep — ${today}`,
+        "",
+        ...deepPromotions.map((promotion, index) => `${index + 1}. (${promotion.score.toFixed(3)}) ${promotion.text}`),
+        "",
+      ];
+      await writeFile(deepReportPath, reportLines.join("\n"), "utf-8");
+
+      const memoryAppend = deepPromotions.map((promotion) => `- ${promotion.text}`).join("\n");
+      const nextMemory = memoryContent.trim()
+        ? `${memoryContent.trimEnd()}\n\n## Dreaming Promotions — ${today}\n${memoryAppend}\n`
+        : `# MEMORY\n\n## Dreaming Promotions — ${today}\n${memoryAppend}\n`;
+      await writeFile(memoryPath, nextMemory, "utf-8");
+    }
+
+    const lines = [
+      `Updated: ${new Date().toISOString()}`,
+      `Promoted: ${deepPromotions.length}`,
+      `Deep report: memory/dreaming/deep/${today}.md`,
+      "",
+      ...deepPromotions.map((promotion, index) => `${index + 1}. (${promotion.score.toFixed(3)}) ${promotion.text.slice(0, 180).replace(/\s+/g, " ")}`),
+    ];
+    await writeDreamSection(workspaceDir, "Deep Sleep", lines.join("\n"));
+  }
+
+  await updateDreamingStatusAt(apiRef.resolvePath("~/.openclaw"), {
+    lastDeepRun: new Date().toISOString(),
+    lastDeepPromoted: promoted,
+  });
+  return { promoted, workspaces: workspaceEntries.length };
+}
+
+export async function runDreamingSweep(params: {
+  api: OpenClawPluginApi;
+  db: { table: { query: () => { where: (clause: string) => { limit: (n: number) => { toArray: () => Promise<unknown[]> } } } } | null; store: (entry: Omit<MemoryEntry, "id" | "created_at" | "chunk_hash" | "created_by"> & { created_by?: string }) => Promise<MemoryEntry & { isDuplicate?: boolean }> };
+  embeddings: { embed: (text: string) => Promise<number[]> };
+  cfg: MemoryConfig;
+}): Promise<{ light: number; rem: number; deep: number }> {
+  const light = await runLightPhase(params.api, params.db, params.embeddings, params.cfg);
+  const rem = await runRemPhase(params.api, params.db, params.embeddings, params.cfg);
+  const deep = await runDeepPhase(params.api, params.db, params.embeddings, params.cfg);
+  await updateDreamingStatusAt(params.api.resolvePath("~/.openclaw"), {
+    lastRun: new Date().toISOString(),
+    lastRunSummary: {
+      lightProcessed: light.processed,
+      remSignals: rem.signals,
+      deepPromoted: deep.promoted,
+    },
+  });
+  return { light: light.processed, rem: rem.signals, deep: deep.promoted };
+}
+
+export async function getDreamingStatus(apiRef: OpenClawPluginApi): Promise<Record<string, unknown>> {
+  return readDreamingStatusAt(apiRef.resolvePath("~/.openclaw"));
+}
+
+export async function updateDreamingStatus(apiRef: OpenClawPluginApi, patch: Record<string, unknown>): Promise<void> {
+  await updateDreamingStatusAt(apiRef.resolvePath("~/.openclaw"), patch);
 }
 
 // ============================================================================
@@ -384,7 +1123,7 @@ class Embeddings {
         if (!isRetryable) throw err;
 
         const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
-        this.logger?.warn?.(`memory-lancedb: embedding retry ${attempt + 1}/${maxRetries} after ${delay}ms: ${errMsg}`);
+        this.logger?.warn?.(`memory-lancedb-ttt: embedding retry ${attempt + 1}/${maxRetries} after ${delay}ms: ${errMsg}`);
         await new Promise(r => setTimeout(r, delay));
       }
     }
@@ -493,8 +1232,8 @@ export function detectCategory(text: string): MemoryCategory {
 // ============================================================================
 
 const memoryPlugin = {
-  id: "memory-lancedb",
-  name: "Memory (LanceDB)",
+  id: "memory-lancedb-ttt",
+  name: "Memory (LanceDB TTT)",
   description: "LanceDB-backed long-term memory with auto-recall/capture",
   kind: "memory" as const,
   configSchema: memoryConfigSchema,
@@ -508,7 +1247,7 @@ const memoryPlugin = {
     const db = new MemoryDB(resolvedDbPath, vectorDim);
     const embeddings = new Embeddings(apiKey, model, baseUrl, dimensions, api.logger);
 
-    api.logger.info(`memory-lancedb: plugin registered (db: ${resolvedDbPath}, lazy init)`);
+    api.logger.info(`memory-lancedb-ttt: plugin registered (db: ${resolvedDbPath}, lazy init)`);
 
     // ========================================================================
     // Tools (all 6 use factory pattern)
@@ -596,7 +1335,7 @@ const memoryPlugin = {
           const callerAgentId = toolCtx?.agentId as string | undefined;
 
           if (looksLikePromptInjection(text)) {
-            api.logger.warn(`memory-lancedb: rejected prompt injection: ${text.slice(0, 50)}...`);
+            api.logger.warn(`memory-lancedb-ttt: rejected prompt injection: ${text.slice(0, 50)}...`);
             return {
               content: [{ type: "text", text: "Content rejected: looks like a prompt injection attempt." }],
               details: { action: "rejected", reason: "prompt_injection" },
@@ -813,7 +1552,7 @@ const memoryPlugin = {
           const callerAgentId = toolCtx?.agentId as string | undefined;
 
           if (looksLikePromptInjection(text)) {
-            api.logger.warn(`memory-lancedb: rejected prompt injection: ${text.slice(0, 50)}...`);
+            api.logger.warn(`memory-lancedb-ttt: rejected prompt injection: ${text.slice(0, 50)}...`);
             return { content: [{ type: "text", text: "Content rejected: looks like a prompt injection attempt." }], details: { action: "rejected", reason: "prompt_injection" } };
           }
 
@@ -915,7 +1654,7 @@ const memoryPlugin = {
               try {
                 vector = await embeddings.embed(chunk);
               } catch (err) {
-                api.logger.warn(`memory-lancedb: reindex embedding failed for chunk: ${String(err)}`);
+                api.logger.warn(`memory-lancedb-ttt: reindex embedding failed for chunk: ${String(err)}`);
                 continue;
               }
 
@@ -929,7 +1668,7 @@ const memoryPlugin = {
           }
 
           const msg = `Reindexed: ${totalChunks} chunks from ${files.length} files for agent ${callerAgentId} (${skippedDuplicates} duplicates skipped)`;
-          api.logger.info(`memory-lancedb: ${msg}`);
+          api.logger.info(`memory-lancedb-ttt: ${msg}`);
           return {
             content: [{ type: "text", text: msg }],
             details: { action: "reindexed", chunks: totalChunks, files: files.length, skipped: skippedDuplicates, agentId: callerAgentId },
@@ -1017,6 +1756,121 @@ const memoryPlugin = {
     );
 
     // ========================================================================
+    // Dreaming
+    // ========================================================================
+
+    api.registerCommand({
+      name: "dreaming",
+      description: "Enable, disable, and inspect memory dreaming.",
+      acceptsArgs: true,
+      handler: async (commandCtx) => {
+        const [firstToken = "help"] = (commandCtx.args?.trim() ?? "").split(/\s+/).filter(Boolean).map((token: string) => token.toLowerCase());
+        const currentConfig = api.runtime.config.loadConfig();
+        const pluginEntry = (currentConfig.plugins?.entries?.["memory-lancedb-ttt"] ?? currentConfig.plugins?.entries?.["memory-lancedb"]) as Record<string, unknown> | undefined;
+        const pluginConfig = (pluginEntry?.config ?? {}) as Record<string, unknown>;
+        const currentDreaming = normalizeDreamingConfig((pluginConfig.dreaming ?? cfg.dreaming) as DreamingConfig | undefined);
+        const status = await getDreamingStatus(api);
+        const formatStatus = () => [
+          "Dreaming status:",
+          `- enabled: ${currentDreaming.enabled ? "on" : "off"}${currentDreaming.timezone ? ` (${currentDreaming.timezone})` : ""}`,
+          `- sweep cadence: ${currentDreaming.frequency}`,
+          `- last run: ${typeof status.lastRun === "string" ? status.lastRun : "never"}`,
+          `- last light: ${typeof status.lastLightRun === "string" ? status.lastLightRun : "never"}`,
+          `- last REM: ${typeof status.lastRemRun === "string" ? status.lastRemRun : "never"}`,
+          `- last deep: ${typeof status.lastDeepRun === "string" ? status.lastDeepRun : "never"}`,
+          `- next scheduled: managed cron on ${currentDreaming.frequency}`,
+        ].join("\n");
+
+        if (firstToken === "status") {
+          return { text: formatStatus() };
+        }
+
+        if (firstToken === "on" || firstToken === "off") {
+          const enabled = firstToken === "on";
+          const entries = { ...(currentConfig.plugins?.entries ?? {}) };
+          const existingEntry = (entries["memory-lancedb-ttt"] ?? entries["memory-lancedb"] ?? {}) as Record<string, unknown>;
+          const existingPluginConfig = (existingEntry.config ?? {}) as Record<string, unknown>;
+          const existingDreaming = (existingPluginConfig.dreaming ?? {}) as Record<string, unknown>;
+          entries["memory-lancedb-ttt"] = {
+            ...existingEntry,
+            config: {
+              ...existingPluginConfig,
+              dreaming: {
+                ...existingDreaming,
+                enabled,
+                frequency: typeof existingDreaming.frequency === "string" ? existingDreaming.frequency : currentDreaming.frequency,
+                ...(typeof existingDreaming.timezone === "string" ? { timezone: existingDreaming.timezone } : {}),
+              },
+            },
+          };
+          await api.runtime.config.writeConfigFile({
+            ...currentConfig,
+            plugins: {
+              ...currentConfig.plugins,
+              entries,
+            },
+          });
+          await updateDreamingStatus(api, { enabled });
+          return { text: `Dreaming ${enabled ? "enabled" : "disabled"}.\n\n${formatStatus()}` };
+        }
+
+        return {
+          text: [
+            "Usage: /dreaming status",
+            "Usage: /dreaming on",
+            "Usage: /dreaming off",
+            "Usage: /dreaming help",
+            "",
+            "Phases:",
+            "- Light sleep stages recent recall traces and daily memory signals.",
+            "- REM sleep extracts themes and reinforcement signals.",
+            "- Deep sleep promotes durable candidates into MEMORY.md.",
+            "",
+            formatStatus(),
+          ].join("\n"),
+        };
+      },
+    });
+
+    api.registerHook("gateway:startup", async (event) => {
+      try {
+        const dreaming = normalizeDreamingConfig(cfg.dreaming);
+        const cron = resolveCronServiceFromStartupEvent(event);
+        await reconcileDreamingCronJob({
+          cron,
+          config: dreaming,
+          logger: {
+            info: (msg) => api.logger.info(msg),
+            warn: (msg) => api.logger.warn(msg),
+          },
+        });
+      } catch (err) {
+        api.logger.error(`memory-lancedb-ttt: dreaming startup reconciliation failed: ${String(err)}`);
+      }
+    }, { name: "memory-lancedb-ttt-dreaming-cron" });
+
+    api.on("before_agent_reply", async (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
+      try {
+        const cleanedBody = typeof event.cleanedBody === "string" ? event.cleanedBody : "";
+        const dreaming = normalizeDreamingConfig(cfg.dreaming);
+        if (ctx.trigger !== "heartbeat" || !cleanedBody.includes(DREAMING_SYSTEM_EVENT_TEXT)) {
+          return undefined;
+        }
+        if (!dreaming.enabled) {
+          return { handled: true, reason: "memory-lancedb-ttt: dreaming disabled" };
+        }
+        const result = await runDreamingSweep({ api, db, embeddings, cfg });
+        return {
+          handled: true,
+          reason: `memory-lancedb-ttt: dreaming sweep complete (light=${result.light}, rem=${result.rem}, deep=${result.deep})`,
+        };
+      } catch (err) {
+        api.logger.error(`memory-lancedb-ttt: dreaming trigger failed: ${String(err)}`);
+        return undefined;
+      }
+    });
+
+    // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 
@@ -1041,7 +1895,23 @@ const memoryPlugin = {
             return;
           }
 
-          api.logger.info?.(`memory-lancedb: injecting ${results.length} memories into context`);
+          if (callerAgentId) {
+            try {
+              const workspaceDir = api.runtime.agent.resolveAgentWorkspaceDir(api.config, callerAgentId)?.trim();
+              if (workspaceDir) {
+                await appendRecallTrace(workspaceDir, {
+                  agentId: callerAgentId,
+                  queryHash: hashText(prompt),
+                  memoryIds: dedupeStrings(results.map((r) => r.entry.id)),
+                  timestamp: new Date().toISOString(),
+                });
+              }
+            } catch (err) {
+              api.logger.warn(`memory-lancedb-ttt: failed to append recall trace: ${String(err)}`);
+            }
+          }
+
+          api.logger.info?.(`memory-lancedb-ttt: injecting ${results.length} memories into context`);
 
           return {
             prependContext: formatRelevantMemoriesContext(
@@ -1049,7 +1919,7 @@ const memoryPlugin = {
             ),
           };
         } catch (err) {
-          api.logger.warn(`memory-lancedb: recall failed: ${String(err)}`);
+          api.logger.warn(`memory-lancedb-ttt: recall failed: ${String(err)}`);
         }
       });
     }
@@ -1137,10 +2007,10 @@ const memoryPlugin = {
           }
 
           if (stored > 0) {
-            api.logger.info(`memory-lancedb: auto-captured ${stored} memories`);
+            api.logger.info(`memory-lancedb-ttt: auto-captured ${stored} memories`);
           }
         } catch (err) {
-          api.logger.warn(`memory-lancedb: capture failed: ${String(err)}`);
+          api.logger.warn(`memory-lancedb-ttt: capture failed: ${String(err)}`);
         }
       });
     }
@@ -1150,14 +2020,14 @@ const memoryPlugin = {
     // ========================================================================
 
     api.registerService({
-      id: "memory-lancedb",
+      id: "memory-lancedb-ttt",
       start: () => {
         api.logger.info(
-          `memory-lancedb: initialized (db: ${resolvedDbPath}, model: ${cfg.embedding.model})`,
+          `memory-lancedb-ttt: initialized (db: ${resolvedDbPath}, model: ${cfg.embedding.model})`,
         );
       },
       stop: () => {
-        api.logger.info("memory-lancedb: stopped");
+        api.logger.info("memory-lancedb-ttt: stopped");
       },
     });
   },

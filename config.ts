@@ -2,6 +2,12 @@ import fs from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+export type DreamingConfig = {
+  enabled: boolean;
+  frequency: string;
+  timezone?: string;
+};
+
 export type MemoryConfig = {
   embedding: {
     provider: "openai";
@@ -18,6 +24,7 @@ export type MemoryConfig = {
   recallMinScore?: number;
   sensitiveAgents?: string[];
   importanceDefault?: number;
+  dreaming?: DreamingConfig;
 };
 
 export const MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
@@ -109,7 +116,7 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "dbPath", "autoCapture", "autoRecall", "captureMaxChars", "sensitiveAgents", "recallLimit", "recallMinScore", "importanceDefault"],
+      ["embedding", "dbPath", "autoCapture", "autoRecall", "captureMaxChars", "sensitiveAgents", "recallLimit", "recallMinScore", "importanceDefault", "dreaming"],
       "memory config",
     );
 
@@ -132,6 +139,18 @@ export const memoryConfigSchema = {
 
     const sensitiveAgents = Array.isArray(cfg.sensitiveAgents) ? cfg.sensitiveAgents.filter((s): s is string => typeof s === "string") : [];
 
+    // Parse dreaming config
+    let dreaming: DreamingConfig | undefined;
+    if (cfg.dreaming && typeof cfg.dreaming === "object" && !Array.isArray(cfg.dreaming)) {
+      const dc = cfg.dreaming as Record<string, unknown>;
+      assertAllowedKeys(dc, ["enabled", "frequency", "timezone"], "dreaming config");
+      dreaming = {
+        enabled: dc.enabled === true,
+        frequency: typeof dc.frequency === "string" ? dc.frequency : "0 3 * * *",
+        timezone: typeof dc.timezone === "string" ? dc.timezone : undefined,
+      };
+    }
+
     return {
       embedding: {
         provider: "openai",
@@ -149,6 +168,7 @@ export const memoryConfigSchema = {
       recallMinScore: typeof cfg.recallMinScore === "number" ? cfg.recallMinScore : 0.3,
       sensitiveAgents,
       importanceDefault: typeof cfg.importanceDefault === "number" ? cfg.importanceDefault : 0.5,
+      dreaming,
     };
   },
   uiHints: {
@@ -216,6 +236,22 @@ export const memoryConfigSchema = {
       help: "Default importance score for auto-captured memories (0.0 - 1.0)",
       advanced: true,
       placeholder: "0.5",
+    },
+    "dreaming.enabled": {
+      label: "Dreaming Enabled",
+      help: "Enable background memory consolidation (light → REM → deep phases)",
+    },
+    "dreaming.frequency": {
+      label: "Dreaming Frequency",
+      help: "Cron expression for dreaming sweep schedule",
+      placeholder: "0 3 * * *",
+      advanced: true,
+    },
+    "dreaming.timezone": {
+      label: "Dreaming Timezone",
+      help: "Timezone for cron schedule (e.g. America/Chicago)",
+      placeholder: "America/Chicago",
+      advanced: true,
     },
   },
 };
