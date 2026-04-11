@@ -911,7 +911,7 @@ class MemoryDB {
     private readonly vectorDim: number,
   ) {}
 
-  private async ensureInitialized(): Promise<void> {
+  async ensureInitialized(): Promise<void> {
     if (this.table) {
       return;
     }
@@ -2018,6 +2018,85 @@ const memoryPlugin = {
     // ========================================================================
     // Service
     // ========================================================================
+
+    // ========================================================================
+    // Memory Runtime Registration
+    // ========================================================================
+    // Register with OpenClaw's memory state system so `openclaw status` reports
+    // memory as available and the bundled memory CLI surface can function.
+
+    api.registerMemoryRuntime({
+      getMemorySearchManager: async (params: {
+        cfg: unknown;
+        agentId: string;
+        purpose?: "default" | "status";
+      }) => {
+        try {
+          await db.ensureInitialized();
+          const manager = {
+            search: async (
+              query: string,
+              opts?: { maxResults?: number; minScore?: number; sessionKey?: string },
+            ) => {
+              const vector = await embeddings.embed(query);
+              const results = await db.search(vector, {
+                limit: opts?.maxResults ?? 5,
+                minScore: opts?.minScore ?? 0.3,
+                agentId: params.agentId,
+              });
+              return results.map((r) => ({
+                path: `memory://lancedb/${r.entry.id}`,
+                startLine: 0,
+                endLine: 0,
+                score: r.score,
+                snippet: r.entry.text,
+                source: "memory" as const,
+              }));
+            },
+            readFile: async (fileParams: {
+              relPath: string;
+              from?: number;
+              lines?: number;
+            }) => ({
+              text: "",
+              path: fileParams.relPath,
+            }),
+            status: () => ({
+              backend: "builtin" as const,
+              provider: "lancedb",
+              model: cfg.embedding.model,
+              dbPath: resolvedDbPath,
+              custom: {
+                pluginId: "memory-lancedb-ttt",
+                vectorDim,
+                autoRecall: cfg.autoRecall ?? false,
+                autoCapture: cfg.autoCapture ?? false,
+              },
+            }),
+            probeEmbeddingAvailability: async () => {
+              try {
+                await embeddings.embed("test");
+                return { ok: true };
+              } catch (err) {
+                return { ok: false, error: String(err) };
+              }
+            },
+            probeVectorAvailability: async () => {
+              try {
+                await db.ensureInitialized();
+                return true;
+              } catch {
+                return false;
+              }
+            },
+          };
+          return { manager };
+        } catch (err) {
+          return { manager: null, error: String(err) };
+        }
+      },
+      resolveMemoryBackendConfig: () => ({ backend: "builtin" as const }),
+    });
 
     api.registerService({
       id: "memory-lancedb-ttt",

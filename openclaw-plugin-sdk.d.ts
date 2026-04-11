@@ -18,6 +18,10 @@ declare module "openclaw/plugin-sdk/memory-lancedb" {
       stop: () => void;
     }) => void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    registerMemoryRuntime: (runtime: any) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    registerMemoryCapability: (capability: any) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     on: (event: string, handler: (...args: any[]) => Promise<unknown>) => void;
     registerCommand: (command: {
       name: string;
