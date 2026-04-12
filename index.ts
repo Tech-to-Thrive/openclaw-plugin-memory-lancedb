@@ -206,6 +206,19 @@ const LIGHT_CANDIDATES_FILE = "light-candidates.json";
 const PHASE_SIGNALS_FILE = "phase-signals.json";
 const DREAMING_STATUS_FILE = "status.json";
 
+/**
+ * Match system event tokens in cleanedBody, compatible with upstream
+ * `includesSystemEventToken` from dreaming-shared. Handles both exact
+ * match and embedded tokens (when runtime wrappers include extra heartbeat text).
+ */
+function includesSystemEventToken(cleanedBody: string, eventText: string): boolean {
+  const normalizedBody = typeof cleanedBody === "string" ? cleanedBody.trim() : "";
+  const normalizedEvent = typeof eventText === "string" ? eventText.trim() : "";
+  if (!normalizedBody || !normalizedEvent) return false;
+  if (normalizedBody === normalizedEvent) return true;
+  return normalizedBody.split(/\r?\n/).some((line) => line.trim() === normalizedEvent);
+}
+
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
@@ -462,19 +475,37 @@ function resolveAllWorkspaceEntries(api: OpenClawPluginApi): Array<{ agentIds: s
 }
 
 export async function appendRecallTrace(workspaceDir: string, trace: RecallTrace): Promise<void> {
+  // Grounded backfill hardening: validate trace inputs
+  if (!workspaceDir || typeof workspaceDir !== "string") return;
+  if (!trace.agentId || !isValidAgentId(trace.agentId)) return;
+  if (!trace.queryHash || typeof trace.queryHash !== "string") return;
+  if (!Array.isArray(trace.memoryIds) || trace.memoryIds.length === 0) return;
+  // Sanitize memoryIds — only keep valid UUID-like strings
+  const sanitizedMemoryIds = trace.memoryIds.filter(
+    (id) => typeof id === "string" && id.length > 0 && id.length <= 64
+  );
+  if (sanitizedMemoryIds.length === 0) return;
+
   const dreamsDir = join(workspaceDir, DREAMS_DIR_RELATIVE);
   const tracesPath = join(dreamsDir, RECALL_TRACES_FILE);
   const lockPath = join(dreamsDir, `${RECALL_TRACES_FILE}.lock`);
 
   await withFileLock(lockPath, async () => {
     const traces = await readJsonFile<RecallTrace[]>(tracesPath, []);
-    traces.push(trace);
+    traces.push({ ...trace, memoryIds: sanitizedMemoryIds });
     const trimmed = traces.slice(-5000);
     await writeJsonFile(tracesPath, trimmed);
   });
 }
 
 export async function writeDreamSection(workspaceDir: string, heading: string, body: string): Promise<void> {
+  // Grounded backfill hardening: validate inputs
+  if (!workspaceDir || typeof workspaceDir !== "string") return;
+  if (!heading || typeof heading !== "string") return;
+  if (typeof body !== "string") return;
+  const sanitizedHeading = heading.replace(/[\n\r]/g, " ").trim();
+  if (!sanitizedHeading) return;
+
   const candidates = [join(workspaceDir, "DREAMS.md"), join(workspaceDir, "dreams.md")];
   let dreamsPath = candidates[0];
   for (const candidate of candidates) {
@@ -485,8 +516,8 @@ export async function writeDreamSection(workspaceDir: string, heading: string, b
   }
 
   const content = await readFile(dreamsPath, "utf-8").catch(() => "");
-  const sectionHeader = `## ${heading}`;
-  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sectionHeader = `## ${sanitizedHeading}`;
+  const escapedHeading = sanitizedHeading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const sectionRegex = new RegExp(`^## ${escapedHeading}\\n(?:(?!## ).*\\n?)*`, "m");
   const nextBlock = `${sectionHeader}\n${body.trim()}\n\n`;
 
@@ -512,6 +543,9 @@ async function readDreamingStatusAt(baseDir: string): Promise<Record<string, unk
 }
 
 async function updateDreamingStatusAt(baseDir: string, patch: Record<string, unknown>): Promise<void> {
+  // Grounded backfill hardening: validate baseDir and patch
+  if (!baseDir || typeof baseDir !== "string") return;
+  if (!patch || typeof patch !== "object") return;
   const statusPath = join(baseDir, "memory", ".dreams", DREAMING_STATUS_FILE);
   const current = await readJsonFile<Record<string, unknown>>(statusPath, {});
   await writeJsonFile(statusPath, {
@@ -799,7 +833,16 @@ export async function runDeepPhase(
 
     for (const winner of winners) {
       const text = winner.candidate.text.trim();
-      if (!text || memoryContent.includes(text.slice(0, Math.min(80, text.length)))) {
+      // Grounded backfill hardening: validate text before promotion
+      if (!text || text.length < 10) {
+        continue;
+      }
+      if (memoryContent.includes(text.slice(0, Math.min(80, text.length)))) {
+        continue;
+      }
+      // Reject prompt injection in deep promotions
+      if (looksLikePromptInjection(text)) {
+        apiRef.logger.warn(`memory-lancedb-ttt: deep phase rejected prompt injection: ${text.slice(0, 50)}...`);
         continue;
       }
       let vector: number[];
@@ -843,11 +886,18 @@ export async function runDeepPhase(
       ];
       await writeFile(deepReportPath, reportLines.join("\n"), "utf-8");
 
-      const memoryAppend = deepPromotions.map((promotion) => `- ${promotion.text}`).join("\n");
-      const nextMemory = memoryContent.trim()
-        ? `${memoryContent.trimEnd()}\n\n## Dreaming Promotions — ${today}\n${memoryAppend}\n`
-        : `# MEMORY\n\n## Dreaming Promotions — ${today}\n${memoryAppend}\n`;
-      await writeFile(memoryPath, nextMemory, "utf-8");
+      // Grounded backfill hardening: sanitize text before appending to MEMORY.md
+      const sanitizedPromotions = deepPromotions
+        .map((promotion) => promotion.text.replace(/[\n\r]+/g, " ").trim())
+        .filter((text) => text.length >= 10);
+
+      if (sanitizedPromotions.length > 0) {
+        const memoryAppend = sanitizedPromotions.map((text) => `- ${text}`).join("\n");
+        const nextMemory = memoryContent.trim()
+          ? `${memoryContent.trimEnd()}\n\n## Dreaming Promotions — ${today}\n${memoryAppend}\n`
+          : `# MEMORY\n\n## Dreaming Promotions — ${today}\n${memoryAppend}\n`;
+        await writeFile(memoryPath, nextMemory, "utf-8");
+      }
     }
 
     const lines = [
@@ -1853,7 +1903,7 @@ const memoryPlugin = {
       try {
         const cleanedBody = typeof event.cleanedBody === "string" ? event.cleanedBody : "";
         const dreaming = normalizeDreamingConfig(cfg.dreaming);
-        if (ctx.trigger !== "heartbeat" || !cleanedBody.includes(DREAMING_SYSTEM_EVENT_TEXT)) {
+        if (ctx.trigger !== "heartbeat" || !includesSystemEventToken(cleanedBody, DREAMING_SYSTEM_EVENT_TEXT)) {
           return undefined;
         }
         if (!dreaming.enabled) {

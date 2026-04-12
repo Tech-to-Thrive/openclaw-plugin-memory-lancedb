@@ -102,6 +102,7 @@ function createMockApi(overrides: Record<string, unknown> = {}) {
     registerHook: vi.fn((hookName: string, handler: unknown, opts?: unknown) => {
       registeredStartupHooks.push({ hookName, handler, opts });
     }),
+    registerMemoryRuntime: vi.fn(),
   };
 
   return { mockApi, registeredTools, registeredClis, registeredServices, registeredHooks, registeredCommands, registeredStartupHooks, logs };
